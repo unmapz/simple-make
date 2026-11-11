@@ -3,6 +3,7 @@
 #include "../include/db.hpp"
 #include "../include/build.hpp"
 #include "../include/parse_cfg.hpp"
+#include "../include/platform.hpp"
 
 #include "cpr/callback.h"
 
@@ -15,13 +16,16 @@
 #include <cstdlib>
 #include <fstream>
 #include <cpr/cpr.h>
+#include <nlohmann/json.hpp>
 #include <filesystem>
 #include <algorithm>
 #include <iostream>
-#include <unistd.h>
 #include <cctype>
 #include <mutex>
 #include <semaphore>
+#include <sstream>
+#include <string_view>
+#include <span>
 
 namespace fs = std::filesystem;
 
@@ -30,6 +34,63 @@ std::mutex mtx;
 
 namespace {
     std::counting_semaphore<> build_slots{ static_cast<std::ptrdiff_t>(std::max(1u, std::thread::hardware_concurrency())) };
+
+    constexpr int kHelpWidth = 78;
+
+    std::vector<std::string> wrap_text(const std::string& text, int width) {
+        std::vector<std::string> lines;
+        std::string current;
+        std::istringstream words(text);
+        std::string word;
+
+        while (words >> word) {
+            std::string candidate = current.empty() ? word : current + " " + word;
+            if (static_cast<int>(candidate.size()) > width) {
+                if (!current.empty())
+                    lines.push_back(current);
+                current = word;
+            } else {
+                current = candidate;
+            }
+        }
+
+        if (!current.empty() || lines.empty())
+            lines.push_back(current);
+
+        return lines;
+    }
+
+    void print_box(std::string_view heading, const std::vector<std::string>& lines) {
+        int inner = kHelpWidth - 6;
+
+        std::string border;
+        for (int i = 0; i < kHelpWidth; i++)
+            border += "█";
+
+        auto row = [&](const std::string& text) {
+            std::string content = text.substr(0, inner);
+            content += std::string(inner - content.size(), ' ');
+            std::println("██ {} ██", content);
+        };
+
+        std::println("{}", border);
+        row("");
+        row(std::string(heading));
+        row("");
+
+        for (auto& l : lines) {
+            if (static_cast<int>(l.size()) <= inner) {
+                row(l);
+            } else {
+                for (auto& wrapped : wrap_text(l, inner))
+                    row(wrapped);
+            }
+        }
+
+        row("");
+        std::println("{}", border);
+        std::println("");
+    }
 
     class SlotGuard {
     public:
@@ -42,130 +103,148 @@ namespace {
     };
 }
 
+static std::string latest_release_tag() {
+    cpr::Response r = cpr::Get(
+        cpr::Url{"https://api.github.com/repos/unmapz/simple-make/releases/latest"},
+        cpr::Header{{"User-Agent", "simple-make"}},
+        cpr::Timeout{4000});
+
+    if (r.status_code != 200)
+        return {};
+
+    auto data = nlohmann::json::parse(r.text, nullptr, false);
+    if (data.is_discarded())
+        return {};
+
+    std::string tag = data.value("tag_name", std::string{});
+    if (!tag.empty() && tag.front() == 'v')
+        tag.erase(0, 1);
+
+    return tag;
+}
+
 int main(int argc, char* argv[]) {
-    if (geteuid() != 0) {
-        std::println("\x1b[31m(failed) [not root] you must run this program as root\x1b[0m");
-        return 1;
-    }
+    platform::enable_ansi_colors();
 
     auto args = std::span(argv, argc).subspan(1);
     if (args.empty()) {
-        std::println("usage: sudo simple-make <package-name> [package-name...]\n");
+        std::println("usage: simple-make <package-name> [package-name...]");
+        std::println("       simple-make --help\n");
+        return 1;
+    }
+
+    std::string_view cmd0 = args[0];
+
+    if (cmd0 == "--version" || cmd0 == "-V") {
+        std::println("simple-make {}", SIMPLE_MAKE_VERSION);
+        return 0;
+    }
+
+    static constexpr std::string_view known_flags[] = {
+        "--help", "-h", "--version", "-V", "--search", "-s", "--remove", "-r",
+        "--delete", "-d", "--update", "-u", "--self-update", "--setup-config"
+    };
+
+    if (cmd0.starts_with('-') && std::ranges::find(known_flags, cmd0) == std::ranges::end(known_flags)) {
+        std::println("\x1b[31m(failed) [unknown option] {} -> run simple-make --help\x1b[0m", cmd0);
         return 1;
     }
 
     load_cfg();
 
-    const char* tmp = std::getenv("SUDO_USER");
-    if (config.home_path.empty())
-        home = tmp ? std::format("/home/{}", tmp) : "/root";
-    else
-        home = config.home_path;
+    home = config.home_path.empty() ? platform::resolve_home_dir() : config.home_path;
+
+    bool needs_install_rights = cmd0 != "--help" && cmd0 != "-h" && cmd0 != "-s" && cmd0 != "--search" &&
+                                 cmd0 != "--setup-config" && cmd0 != "--remove" && cmd0 != "-r" &&
+                                 cmd0 != "--delete" && cmd0 != "-d";
+
+    if (needs_install_rights) {
+        std::string prefix = config.install_prefix.empty() ? platform::default_install_prefix() : config.install_prefix;
+        bool needs_root = platform::requires_elevation() && !prefix.starts_with(home);
+
+        if (needs_root && !platform::is_elevated()) {
+            std::println("\x1b[31m(failed) [not elevated] install_prefix ({}) is outside your home directory, so this needs elevated privileges (Linux/BSD: sudo; Windows: an elevated/Administrator terminal).\x1b[0m", prefix);
+            return 1;
+        }
+    }
+
+    if (config.auto_update_check && cmd0 != "--self-update" && cmd0 != "--help" && cmd0 != "-h") {
+        std::string latest = latest_release_tag();
+        if (!latest.empty() && latest != SIMPLE_MAKE_VERSION)
+            std::println("(note) simple-make {} is out (you have {}) -> run simple-make --self-update", latest, SIMPLE_MAKE_VERSION);
+    }
 
     if (std::string_view(args[0]) == "--help" || std::string_view(args[0]) == "-h") {
-        std::println("\nsimple-make — modern package downloader & builder (C++23)\n\n");
+        std::println("\nsimple-make {} — modern package downloader & builder (C++23)\n", SIMPLE_MAKE_VERSION);
 
-        std::println("████████████████████████████████████████████████████████████████████████████████████████████████████████████████████");
-        std::println("██                                                                                                                ██");
-        std::println("██  usage:                                                                                                        ██");
-        std::println("██      simple-make <package-name>                   search, download and build a package by name                 ██");
-        std::println("██      simple-make <github-url>                     download and build a package directly from a github URL      ██");
-        std::println("██      simple-make <any_url.com/examle.tar.gz>      download, extract and build a package directly from any URL  ██");
-        std::println("██                                                                                                                ██");
-        std::println("████████████████████████████████████████████████████████████████████████████████████████████████████████████████████\n\n");
+        print_box("usage:", {
+            "simple-make <package-name>         search, download and build a package by name",
+            "simple-make <github-url>           download and build a package directly from a GitHub URL",
+            "simple-make <url.com/pkg.tar.gz>   download, extract and build a package from any URL",
+        });
 
+        print_box("options:", {
+            "-h, --help                    print this help and exit",
+            "-V, --version                 print the version and exit",
+            "-r, --remove, --delete, -d    remove installed packages",
+            "-s, --search                  search for a package across all configured sources",
+            "-u, --update [package...]     rebuild installed packages (all of them, if none given)",
+            "--self-update                 check simple-make's own releases and rebuild itself if newer",
+            "--setup-config                interactive config wizard",
+        });
 
-        std::println("██████████████████████████████████████████████████████████████████████████████");
-        std::println("██                                                                          ██");
-        std::println("██  options:                                                                ██");
-        std::println("██      -h, --help                    print this help information and exit  ██");
-        std::println("██      -r, --remove, --delete, -d    remove all installed packages         ██");
-        std::println("██      -s, --search                  search for a package                  ██");
-        std::println("██      --setup-config                setup config file                     ██");
-        std::println("██                                                                          ██");
-        std::println("██████████████████████████████████████████████████████████████████████████████\n\n");
+        print_box("examples:", {
+            "simple-make peaclock       (fast local database match)",
+            "simple-make yq             (live search across GitHub/GitLab/Codeberg)",
+            "simple-make ripgrep        (tries your system package manager first)",
+            "simple-make https://github.com/unmapz/simple-make                     (from a GitHub URL)",
+            "simple-make https://openbox.org/dist/openbox/openbox-3.6.1.tar.xz           (from a tarball URL)",
+        });
 
+        print_box("dependencies:", {
+            "version control:  git",
+            "",
+            "compilers & build systems:",
+            "  c/c++        -> make, cmake, meson, ninja, gcc/g++, autoconf/automake",
+            "  rust         -> cargo, rustc",
+            "  go           -> go",
+            "  python       -> pip",
+            "  java         -> mvn or gradle, plus native-image or javac",
+            "",
+            "archivers & extractors:",
+            "  tar/gz/xz/bz2/zst -> tar, gzip, xz, bzip2, zstd",
+            "  zip / 7z / rar    -> unzip, 7z, unrar",
+            "",
+            "system package managers (tried before building from source):",
+            "  apt-get, dnf, pacman, zypper, apk (Linux) / brew (macOS) / pkg (BSD) / winget, choco (Windows)",
+        });
 
-        std::println("██████████████████████████████████████████████████████████████████████████████████████████████████████████████");
-        std::println("██                                                                                                          ██");
-        std::println("██  examples:                                                                                               ██");
-        std::println("██      simple-make peaclock     (Uses fast local database match)                                           ██");
-        std::println("██      simple-make yq           (Triggers automated GitHub API search)                                     ██");
-        std::println("██                                                                                                          ██");
-        std::println("██      simple-make https://github.com/ArtemyStudio/simple-make              (Installing from GH URL)       ██");
-        std::println("██      simple-make https://openbox.org/dist/openbox/openbox-3.6.1.tar.xz    (Instalinug from URL, tar.gz)  ██");
-        std::println("██                                                                                                          ██");
-        std::println("██████████████████████████████████████████████████████████████████████████████████████████████████████████████\n\n");
+        print_box("config (~/.config/simple-make/simple-make.conf):", {
+            "[bool]   auto_confirm                 automatically approve build prompts",
+            "[bool]   keep_sources                 keep sources after installation",
+            "[int]    jobs                          cores to use for compilation (0 = auto)",
+            "[string] home_path                     override the detected home directory",
+            "[string] install_prefix                where built packages are installed (default: ~/.local -- builds and configures run as you, not root; root is only used to copy into prefixes outside your home, like /usr/local)",
+            "[string] github_token                  raises GitHub's limit from 60 to 5000 req/hour",
+            "[string] gitlab_token                  raises GitLab's anonymous API rate limit",
+            "[bool]   use_system_package_manager    try apt/dnf/pacman/brew/pkg/winget/choco first",
+            "[bool]   auto_update_check             check simple-make's own releases on startup",
+            "[list]   search_providers              comma-separated: github, gitlab, codeberg",
+            "",
+            "example:",
+            "  github_token = \"ghp_x87yA2b3C4d5E6f7G8h9I0j1K2l3M4n5O6p7\"  # not a real token",
+            "  keep_sources = true",
+            "  install_prefix = \"/usr/local\"",
+            "  search_providers = \"github, gitlab\"",
+        });
 
-
-        std::println("█████████████████████████████████████████████████████████████████");
-        std::println("██                                                             ██");
-        std::println("██  dependencies:                                              ██");
-        std::println("██     version control:                                        ██");
-        std::println("██        git                 -> git                           ██");
-        std::println("██                                                             ██");
-        std::println("██     compilers & build systems:                              ██");
-        std::println("██        c/c++ (make)        -> make                          ██");
-        std::println("██        c/c++ (cmake)       -> cmake                         ██");
-        std::println("██        c/c++ (meson)       -> meson                         ██");
-        std::println("██        c/c++ (ninja)       -> ninja                         ██");
-        std::println("██        c/c++ (gcc/g++)     -> gcc / g++                     ██");
-        std::println("██        c/c++ (autotools)   -> autoconf / automake           ██");
-        std::println("██        rust (cargo)        -> cargo                         ██");
-        std::println("██        rust (rustc)        -> rustc                         ██");
-        std::println("██        go (go)             -> go                            ██");
-        std::println("██        python (pip)        -> pip                           ██");
-        std::println("██        java (maven)        -> mvn                           ██");
-        std::println("██        java (gradle)       -> gradle                        ██");
-        std::println("██        java (native-image) -> native-image                  ██");
-        std::println("██        java (javac)        -> javac                         ██");
-        std::println("██                                                             ██");
-        std::println("██     archivers & extractors:                                 ██");
-        std::println("██        tar archives        -> tar                           ██");
-        std::println("██        gzip (.gz)          -> gzip                          ██");
-        std::println("██        xz (.xz)            -> xz                            ██");
-        std::println("██        bzip2 (.bz2)        -> bzip2                         ██");
-        std::println("██        zstandard (.zst)    -> zstd                          ██");
-        std::println("██        zip (.zip)          -> unzip                         ██");
-        std::println("██        7-zip (.7z)         -> 7z                            ██");
-        std::println("██        rar (.rar)          -> unrar                         ██");
-        std::println("██                                                             ██");
-        std::println("█████████████████████████████████████████████████████████████████\n\n");
-
-
-        std::println("█████████████████████████████████████████████████████████████████████████████████████████████████████");
-        std::println("██                                                                                                 ██");
-        std::println("██  config (~/.config/simple-make/simple-make.conf):                                               ██");
-        std::println("██     options:                                                                                    ██");
-        std::println("██          [bool]   auto_confirm    ->  automatically approves questions                          ██");
-        std::println("██          [bool]   keep_sources    ->  keep sources after installation                           ██");
-        std::println("██          [int]    jobs            ->  how many cores will be used for compilation               ██");
-        std::println("██          [string] home_path       ->  the path to the home directory                            ██");
-        std::println("██          [string] install_prefix  ->  where the binary will be installed                        ██");
-        std::println("██          [string] github_token    ->  this is a very important thing; without it, you can only  ██");
-        std::println("██                                         send 60 requests per hour                               ██");
-        std::println("██                                                                                                 ██");
-        std::println("██     example:                                                                                    ██");
-        std::println("██           github_token = \"ghp_x87yA2b3C4d5E6f7G8h9I0j1K2l3M4n5O6p7\"                             ██");
-        std::println("██           keep_sources = true                                                                   ██");
-        std::println("██           # this is comment. btw, the github token isn't real; don't even bother trying         ██");
-        std::println("██           install_prefix = \"/usr/local\"                                                         ██");
-        std::println("██           # Be careful: the binary will be installed in /usr/local/bin/ (by default, they are   ██");
-        std::println("██           #   installed there anyway, but you can change the path)                              ██");
-        std::println("██          home_path = \"/home/artemy\"                                                             ██");
-        std::println("██                                                                                                 ██");
-        std::println("█████████████████████████████████████████████████████████████████████████████████████████████████████\n\n");
-
-        std::println("████████████████████████████████████████████████████████████");
-        std::println("██                                                        ██");
-        std::println("██    paths:                                              ██");
-        std::println("██        config: ~/.config/simple-make/simple-make.conf  ██");
-        std::println("██        sources: ~/.simple-make/sources                 ██");
-        std::println("██        installed_list: ~/.simple-make/installed        ██");
-        std::println("██        compressed: ~/.simple-make/compressed           ██");
-        std::println("██        logs: ~/.simple-make/logs                       ██");
-        std::println("██                                                        ██");
-        std::println("████████████████████████████████████████████████████████████");
+        print_box("paths:", {
+            "config:         ~/.config/simple-make/simple-make.conf",
+            "sources:        ~/.simple-make/sources",
+            "installed_list: ~/.simple-make/installed",
+            "compressed:     ~/.simple-make/compressed",
+            "logs:           ~/.simple-make/logs",
+        });
 
         return 0;
     } else if (std::string_view(args[0]) == "--remove" || std::string_view(args[0]) == "-r" || std::string_view(args[0]) == "--delete" || std::string_view(args[0]) == "-d") {
@@ -202,11 +281,15 @@ int main(int argc, char* argv[]) {
         }
 
         for (auto& entry : deleting) {
-            fs::remove(entry);
+            std::error_code ec;
+            fs::remove(entry, ec);
+            if (ec)
+                locked_println("\x1b[31m(failed) [{}] {}\x1b[0m", ec.message(), entry);
         }
 
         for (auto& package : packages) {
             fs::remove(std::format("{}/.simple-make/installed/{}.list", home, package));
+            fs::remove(std::format("{}/.simple-make/installed/{}.url", home, package));
         }
 
         {
@@ -244,20 +327,16 @@ int main(int argc, char* argv[]) {
         std::string auto_confirm_input;
         std::getline(std::cin, auto_confirm_input);
 
-        if (auto_confirm_input == "y" || auto_confirm_input == "Y")
-            cfg_file << "auto_confirm = true\n";
-        else
-            cfg_file << "auto_confirm = false\n";
+        config.auto_confirm = (auto_confirm_input == "y" || auto_confirm_input == "Y");
+        cfg_file << "auto_confirm = " << (config.auto_confirm ? "true" : "false") << "\n";
         std::println("");
 
         std::print("do you want to set keep sources? (y/N) >");
         std::string keep_sources_input;
         std::getline(std::cin, keep_sources_input);
 
-        if (keep_sources_input == "y" || keep_sources_input == "Y")
-            cfg_file << "keep_sources = true\n";
-        else
-            cfg_file << "keep_sources = false\n";
+        config.keep_sources = (keep_sources_input == "y" || keep_sources_input == "Y");
+        cfg_file << "keep_sources = " << (config.keep_sources ? "true" : "false") << "\n";
         std::println("");
 
         while (1) {
@@ -272,10 +351,13 @@ int main(int argc, char* argv[]) {
 
             try {
                 int num = std::stoi(jobs_input);
-                if (num > 0)
+                if (num > 0) {
+                    config.jobs = num;
                     cfg_file << "jobs = " + std::to_string(num) + "\n";
-                else
+                } else {
+                    config.jobs = 0;
                     break;
+                }
                 break;
             } catch (...) {
                 std::println("i think you'd better enter a valid number\n");
@@ -284,13 +366,14 @@ int main(int argc, char* argv[]) {
         std::println("");
 
         while (1) {
-            std::print("install prefix? (default: /usr/local/) >");
+            std::print("install prefix? (default: ~/.local -- builds and configures as you, root is only used for system-wide prefixes like /usr/local) >");
             std::string install_prefix_input;
             std::getline(std::cin, install_prefix_input);
 
             if (install_prefix_input.empty()) {
                 break;
             } else if (install_prefix_input.contains('/')) {
+                config.install_prefix = install_prefix_input;
                 cfg_file << "install_prefix = \"" + install_prefix_input + "\"\n";
                 break;
             } else {
@@ -310,12 +393,37 @@ int main(int argc, char* argv[]) {
 
             cpr::Response r = cpr::Get(cpr::Url{"https://api.github.com/user"}, cpr::Header{{"Authorization", std::format("token {}", github_token_input)}, {"User-Agent", "simple-make"}});
             if (r.status_code == 200) {
+                config.github_token = github_token_input;
                 cfg_file << "github_token = \"" + github_token_input + "\"\n";
                 break;
             }
 
             std::println("github token is isn't working. please check it again.\n");
         }
+
+        std::println("");
+
+        std::print("gitlab token, for raising GitLab's anonymous search rate limit? (default: empty) >");
+        std::string gitlab_token_input;
+        std::getline(std::cin, gitlab_token_input);
+        if (!gitlab_token_input.empty()) {
+            config.gitlab_token = gitlab_token_input;
+            cfg_file << "gitlab_token = \"" + gitlab_token_input + "\"\n";
+        }
+        std::println("");
+
+        std::print("try the system package manager (apt/dnf/pacman/brew/pkg/winget/choco) before building from source? (Y/n) >");
+        std::string use_pkg_mgr_input;
+        std::getline(std::cin, use_pkg_mgr_input);
+        config.use_system_package_manager = !(use_pkg_mgr_input == "n" || use_pkg_mgr_input == "N");
+        cfg_file << "use_system_package_manager = " << (config.use_system_package_manager ? "true" : "false") << "\n";
+        std::println("");
+
+        std::print("check simple-make's own releases for updates on startup? (y/N) >");
+        std::string auto_update_input;
+        std::getline(std::cin, auto_update_input);
+        config.auto_update_check = (auto_update_input == "y" || auto_update_input == "Y");
+        cfg_file << "auto_update_check = " << (config.auto_update_check ? "true" : "false") << "\n";
         std::println("");
 
         while (1) {
@@ -326,59 +434,114 @@ int main(int argc, char* argv[]) {
             if (home_path_input.empty()) {
                 break;
             } else if (home_path_input.contains('/')) {
+                config.home_path = home_path_input;
                 cfg_file << "home_path = \"" + home_path_input + "\"\n";
                 break;
             } else {
                 std::println("i think you'd better enter a valid path\n");
             }
         }
+
         std::println("");
 
-        std::println("█████████████████████████████");
-        std::println("██                         ██");
-        std::println("██    auto_confirm = {}    ██", config.auto_confirm ? "true" : "false");
-        std::println("██    keep_sources = {}    ██", config.keep_sources ? "true" : "false");
-        std::println("██    jobs = {}            ██", config.jobs == 0 ? "auto" : std::to_string(config.jobs));
-        std::println("██    install_prefix = {}  ██", config.install_prefix);
-        std::println("██    github_token = {}    ██", config.github_token == "" ? "empty" : config.github_token);
-        std::println("██    home_path = {}       ██", config.home_path == "" ? "/root" : config.home_path);
-        std::println("██                         ██");
-        std::println("█████████████████████████████");
+        print_box("saved:", {
+            std::format("auto_confirm = {}", config.auto_confirm ? "true" : "false"),
+            std::format("keep_sources = {}", config.keep_sources ? "true" : "false"),
+            std::format("jobs = {}", config.jobs == 0 ? "auto" : std::to_string(config.jobs)),
+            std::format("install_prefix = {}", config.install_prefix),
+            std::format("github_token = {}", config.github_token.empty() ? "empty" : config.github_token),
+            std::format("gitlab_token = {}", config.gitlab_token.empty() ? "empty" : config.gitlab_token),
+            std::format("use_system_package_manager = {}", config.use_system_package_manager ? "true" : "false"),
+            std::format("auto_update_check = {}", config.auto_update_check ? "true" : "false"),
+            std::format("home_path = {}", config.home_path.empty() ? "/root" : config.home_path),
+        });
 
         cfg_file.close();
+        platform::fix_ownership(std::format("{}/.config/simple-make", home));
+        platform::fix_ownership(std::format("{}/.config/simple-make/simple-make.conf", home));
         return 0;
     } else if (std::string_view(args[0]) == "-s" || std::string_view(args[0]) == "--search") {
-    std::vector<std::string_view> packages(args.begin() + 1, args.end());
-    
-    for (auto& package : packages) {
-        auto res = search_on_gh(package, true, 3);
+        std::vector<std::string_view> packages(args.begin() + 1, args.end());
 
-        bool installed = fs::exists(std::format("{}/.simple-make/installed/{}.list", home, package));
+        for (auto& package : packages) {
+            auto candidates = search_all_sources(package, 3);
 
-        if (!res.has_value()) {
-            std::vector<std::string> urls = std::move(res.error());
+            bool installed = fs::exists(std::format("{}/.simple-make/installed/{}.list", home, package));
 
-            if (urls.empty()) {
+            if (candidates.empty()) {
                 locked_println("\x1b[31m(failed) [no links found] package: {}\x1b[0m", package);
             } else {
                 locked_println("\x1b[32m(finished) [done] package: {}{}\x1b[0m", package, installed ? " (installed)" : "");
-                for (const auto& url : urls) {
-                    locked_println("  -> \x1b[34m{}\x1b[0m", url);
+                for (const auto& c : candidates) {
+                    locked_println("  -> \x1b[34m{}\x1b[0m ({}★, {})", c.url, c.stars, c.source);
                 }
             }
-        } else {
-            std::string url = res.value();
-            if (url.starts_with("https")) {
-                locked_println("\x1b[32m(finished) [done] package: {} -> \x1b[34m{}\x1b[0m{}", package, url, installed ? " (installed)" : "");
-            } else {
-                locked_println("\x1b[31m(failed) [{}] package: {}\x1b[0m", url, package);
+            std::println("");
+        }
+
+        return 0;
+    } else if (std::string_view(args[0]) == "-u" || std::string_view(args[0]) == "--update") {
+        std::vector<std::string> packages(args.begin() + 1, args.end());
+
+        if (packages.empty()) {
+            std::string installed_dir = std::format("{}/.simple-make/installed", home);
+            std::error_code ec;
+            if (fs::exists(installed_dir, ec)) {
+                for (auto& entry : fs::directory_iterator(installed_dir, ec)) {
+                    if (entry.path().extension() == ".list")
+                        packages.push_back(entry.path().stem().string());
+                }
             }
         }
-        std::println("");
-    }
 
-    return 0;
-}
+        if (packages.empty()) {
+            std::println("\x1b[31m(failed) [nothing installed to update]\x1b[0m");
+            return 1;
+        }
+
+        std::vector<std::string> targets;
+        targets.reserve(packages.size());
+
+        for (auto& pkg : packages) {
+            std::string url_path = std::format("{}/.simple-make/installed/{}.url", home, pkg);
+            std::ifstream url_file(url_path);
+            std::string saved_url;
+            if (url_file.is_open() && std::getline(url_file, saved_url) && !saved_url.empty()) {
+                targets.push_back(saved_url);
+            } else {
+                locked_println("(note) [{}] no recorded source, re-resolving by name", pkg);
+                targets.push_back(pkg);
+            }
+        }
+
+        std::vector<std::thread> update_runners;
+        update_runners.reserve(targets.size());
+        for (auto& target : targets)
+            update_runners.emplace_back(process_package, std::string_view(target), targets.size(), true);
+        for (auto& runner : update_runners)
+            runner.join();
+
+        return 0;
+    } else if (std::string_view(args[0]) == "--self-update") {
+        std::string latest = latest_release_tag();
+
+        if (latest.empty()) {
+            std::println("\x1b[31m(failed) [cannot check for updates]\x1b[0m");
+            return 1;
+        }
+
+        if (latest == SIMPLE_MAKE_VERSION) {
+            std::println("simple-make is already up to date (v{})", SIMPLE_MAKE_VERSION);
+            return 0;
+        }
+
+        std::println("a newer version is available: v{} -> v{}", SIMPLE_MAKE_VERSION, latest);
+        if (!do_continue())
+            return 0;
+
+        process_package("https://github.com/unmapz/simple-make", 1, true);
+        return 0;
+    }
 
 
 
@@ -386,7 +549,7 @@ int main(int argc, char* argv[]) {
     runners.reserve(args.size());
 
     for (char* arg : args) {
-        runners.emplace_back(process_package, std::string_view(arg), args.size());
+        runners.emplace_back(process_package, std::string_view(arg), args.size(), false);
     }
 
     for (auto& runner : runners) {
@@ -405,39 +568,63 @@ int main(int argc, char* argv[]) {
 }
 
 bool prepare_paths(std::string_view package) {
-    try {
-        if (home.empty()) {
-            locked_println("\x1b[31mhome path is not found!\x1b[0m");
-            return false;
+    if (home.empty()) {
+        locked_println("\x1b[31mhome path is not found!\x1b[0m");
+        return false;
+    }
+
+    std::string root = home + "/.simple-make";
+    static std::once_flag hint_flag;
+
+    auto fail = [&](const std::string& path, const std::string& reason) {
+        locked_println("\x1b[31m(failed) [cannot write to {}: {}] package: {}\x1b[0m", path, reason, package);
+
+        if (!platform::is_windows) {
+            std::call_once(hint_flag, [&] {
+                locked_println("    this usually means an earlier run as root created it. fix it once with:");
+                locked_println("    sudo chown -R \"$(id -un)\": {}", platform::shell_quote(root));
+            });
         }
 
-        if (!fs::exists(home + "/.simple-make")) {
-            fs::create_directory(home + "/.simple-make");
-            fs::create_directory(home + "/.simple-make/sources");
-            fs::create_directory(home + "/.simple-make/installed");
-            fs::create_directory(home + "/.simple-make/logs");
-        } else {
-            if (!fs::exists(home + "/.simple-make/sources")) 
-                fs::create_directory(home +"/.simple-make/sources");
-            if (!fs::exists(home + "/.simple-make/logs")) 
-                fs::create_directory(home +"/.simple-make/logs");
-            if (!fs::exists(home + "/.simple-make/installed"))
-                fs::create_directory(home +"/.simple-make/installed");
-        }
-        std::string pkg_path = std::format("{}/.simple-make/sources/{}", home, package);
-        if (!fs::exists(pkg_path)) {
-            fs::create_directory(pkg_path);
-        } else {
-            fs::remove_all(pkg_path);
-            fs::create_directory(pkg_path);
-        }
-    } catch (...) { return false; }
+        return false;
+    };
+
+    std::error_code ec;
+
+    for (const char* sub : {"", "/sources", "/installed", "/logs"}) {
+        std::string dir = root + sub;
+
+        fs::create_directories(dir, ec);
+        if (ec)
+            return fail(dir, ec.message());
+
+        if (!platform::is_writable(dir))
+            return fail(dir, "permission denied");
+    }
+
+    std::string pkg_path = std::format("{}/sources/{}", root, package);
+
+    fs::remove_all(pkg_path, ec);
+    if (ec)
+        return fail(pkg_path, ec.message());
+
+    fs::create_directories(pkg_path, ec);
+    if (ec)
+        return fail(pkg_path, ec.message());
+
+    platform::fix_ownership(root);
+    platform::fix_ownership(root + "/sources");
+    platform::fix_ownership(root + "/installed");
+    platform::fix_ownership(root + "/logs");
+    platform::fix_ownership(pkg_path);
 
     return true;
-} 
+}
 
 bool clone_repo_via_git(std::string_view url, std::string_view package) {
-    std::string cmd = std::format("git clone --quiet {} {}/.simple-make/sources/{}", url, home, package);
+    std::string dest = std::format("{}/.simple-make/sources/{}", home, package);
+    std::string cmd = std::format("git clone --quiet -- {} {}", platform::shell_quote(std::string(url)), platform::shell_quote(dest));
+    cmd = platform::wrap_unprivileged(cmd);
 
     int status = system(cmd.c_str());
 
@@ -449,25 +636,40 @@ bool clone_repo_via_git(std::string_view url, std::string_view package) {
 }
 
 std::string get_filename_from_url(std::string_view url) {
+    for (std::string_view marker : {"/archive/", "/releases/download/"}) {
+        size_t marker_pos = url.find(marker);
+        if (marker_pos == std::string_view::npos)
+            continue;
+
+        std::string_view before = url.substr(0, marker_pos);
+        size_t repo_pos = before.rfind('/');
+        if (repo_pos != std::string_view::npos && repo_pos + 1 < before.size())
+            return std::string(before.substr(repo_pos + 1));
+    }
+
     std::string_view raw_name;
     size_t slash_pos = url.rfind('/');
-    
+
     if (slash_pos == std::string_view::npos)
         raw_name = url;
     else
         raw_name = url.substr(slash_pos + 1);
 
-    std::string final_name;
-    
-    for (char c : raw_name) {
-        if (c == '.') {
+    std::string name(raw_name);
+
+    static constexpr std::string_view suffixes[] = {
+        ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tgz",
+        ".zip", ".7z", ".rar", ".gz", ".xz", ".bz2", ".git"
+    };
+
+    for (std::string_view suffix : suffixes) {
+        if (name.size() > suffix.size() && name.ends_with(suffix)) {
+            name.resize(name.size() - suffix.size());
             break;
         }
-
-        final_name += c;
     }
 
-    return final_name;
+    return name;
 }
 
 std::string get_filename_and_extension_from_url(std::string_view url) {
@@ -496,12 +698,15 @@ bool download_file(std::string_view url) {
         std::println("╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝╚═╝\n");
     }
 
-    if (!fs::exists(std::format("{}/.simple-make/compressed/", home)))
-        fs::create_directory(std::format("{}/.simple-make/compressed/", home));
-    else if (!fs::exists(std::format("{}/.simple-make/compressed/{}", home, name)))
-        fs::create_directory(std::format("{}/.simple-make/compressed/{}", home, name));
-    
     std::string dir_path = std::format("{}/.simple-make/compressed/{}", home, name);
+
+    std::error_code dir_ec;
+    fs::create_directories(dir_path, dir_ec);
+    if (dir_ec) {
+        locked_println("\x1b[31m(failed) [cannot create download directory] {}\x1b[0m", dir_path);
+        return false;
+    }
+
     std::string file_path = std::format("{}/{}", dir_path, full_name);
     std::string pkg_path = std::format("{}/.simple-make/sources/{}", home, name);
 
@@ -520,41 +725,45 @@ bool download_file(std::string_view url) {
     out.close();
 
     if (r.status_code != 200) {
+        locked_println("\x1b[31m(failed) [download returned HTTP {}] {}\x1b[0m", r.status_code, url);
         fs::remove_all(dir_path);
         return false;
     }
 
     std::string cmd;
+    std::string q_file = platform::shell_quote(file_path);
+    std::string q_pkg = platform::shell_quote(pkg_path);
 
     if (url.ends_with(".tar.gz") || url.ends_with(".tgz")) {
-        cmd = std::format("tar -xzf '{}' -C '{}' --strip-components=1", file_path, pkg_path);
+        cmd = std::format("tar -xzf {} -C {} --strip-components=1", q_file, q_pkg);
     } else if (url.ends_with(".tar.bz2")) {
-        cmd = std::format("tar -xjf '{}' -C '{}' --strip-components=1", file_path, pkg_path);
+        cmd = std::format("tar -xjf {} -C {} --strip-components=1", q_file, q_pkg);
     } else if (url.ends_with(".tar.xz")) {
-        cmd = std::format("tar -xJf '{}' -C '{}' --strip-components=1", file_path, pkg_path);
+        cmd = std::format("tar -xJf {} -C {} --strip-components=1", q_file, q_pkg);
     } else if (url.ends_with(".tar.zst")) {
-        cmd = std::format("tar --zstd -xf '{}' -C '{}' --strip-components=1", file_path, pkg_path);
+        cmd = std::format("tar --zstd -xf {} -C {} --strip-components=1", q_file, q_pkg);
     } else if (url.ends_with(".zip")) {
-        cmd = std::format("unzip -o '{}' -d '{}'", file_path, pkg_path);
+        cmd = std::format("unzip -o {} -d {}", q_file, q_pkg);
     } else if (url.ends_with(".7z")) {
-        cmd = std::format("7z x '{}' -o'{}'", file_path, pkg_path);
+        cmd = std::format("7z x {} -o{}", q_file, q_pkg);
     } else if (url.ends_with(".rar")) {
-        cmd = std::format("unrar x '{}' '{}'", file_path, pkg_path);
+        cmd = std::format("unrar x {} {}", q_file, q_pkg);
     } else if (url.ends_with(".gz")) {
-        cmd = std::format("gzip -dk '{}'", file_path);
+        cmd = std::format("gzip -dkc {} > {}", q_file, platform::shell_quote(std::format("{}/{}", pkg_path, name)));
     } else if (url.ends_with(".xz")) {
-        cmd = std::format("xz -dk '{}'", file_path);
+        cmd = std::format("xz -dkc {} > {}", q_file, platform::shell_quote(std::format("{}/{}", pkg_path, name)));
     } else if (url.ends_with(".bz2")) {
-        cmd = std::format("bzip2 -dk '{}'", file_path);
+        cmd = std::format("bzip2 -dkc {} > {}", q_file, platform::shell_quote(std::format("{}/{}", pkg_path, name)));
     } else {
         locked_println("\x1b[31munsupported archive format!\x1b[0m");
-        fs::remove(dir_path);
+        fs::remove_all(dir_path);
         return false;
     }
 
+    cmd = platform::wrap_unprivileged(cmd);
     int status = std::system(cmd.c_str());
 
-    fs::remove(dir_path);
+    fs::remove_all(dir_path);
 
     if (status == 0) {
         return true;
@@ -563,21 +772,47 @@ bool download_file(std::string_view url) {
     }
 }
 
-void process_package(std::string_view pkg, std::size_t total_packages) {
+static bool valid_pkg_name(const std::string& name) {
+    if (name.empty() || name.size() > 128)
+        return false;
+
+    if (name.front() == '-' || name.front() == '.')
+        return false;
+
+    for (unsigned char c : name) {
+        if (!std::isalnum(c) && c != '.' && c != '_' && c != '+' && c != '-')
+            return false;
+    }
+
+    return true;
+}
+
+static bool already_installed(const std::string& pkg_name) {
+    if (fs::exists(std::format("{}/.simple-make/installed/{}.list", home, pkg_name)))
+        return true;
+
+    if (platform::is_installed_via_package_manager(pkg_name))
+        return true;
+
+    return platform::tool_available(pkg_name);
+}
+
+void process_package(std::string_view pkg, std::size_t total_packages, bool is_update) {
     SlotGuard slot(build_slots);
 
     std::string package(pkg);
     std::transform(package.begin(), package.end(), package.begin(), [](unsigned char c) { return std::tolower(c); });
 
-    bool is_github_url = package.starts_with("https://github") || package.starts_with("http://github");
-    bool is_github_bare = package.starts_with("://github.com") || package.starts_with("github.com");
-    bool is_archive_url = !package.contains("github")    && (package.ends_with(".tar.gz")  ||
+    bool is_archive_url = package.ends_with(".tar.gz")  ||  package.ends_with(".tgz")     ||
                 package.ends_with(".tar.xz")  ||  package.ends_with(".zip")     ||
                 package.ends_with(".tar.zst") ||  package.ends_with(".tar.bz2") ||
                 package.ends_with(".gz")      ||  package.ends_with(".xz")      ||
                 package.ends_with(".7z")      ||  package.ends_with(".bz2")     ||
-                package.ends_with(".rar"));
-                
+                package.ends_with(".rar");
+
+    bool is_github_url = !is_archive_url && (package.starts_with("https://github") || package.starts_with("http://github"));
+    bool is_github_bare = !is_archive_url && (package.starts_with("://github.com") || package.starts_with("github.com"));
+
     std::string url;
     std::string pkg_name = package;
 
@@ -593,10 +828,24 @@ void process_package(std::string_view pkg, std::size_t total_packages) {
         return;
     }
 
-    if (!prepare_paths(pkg_name)) {
-        locked_println("\x1b[31m(failed) [cannot create paths] package: {}\x1b[0m", pkg_name);
+    if (!valid_pkg_name(pkg_name)) {
+        locked_println("\x1b[31m(failed) [unsafe package name] package: {} -> only letters, digits, '.', '_', '+' and '-' are allowed\x1b[0m", pkg_name);
         return;
     }
+
+    if (!is_update && already_installed(pkg_name)) {
+        locked_println("\x1b[31m(failed) [already installed] package: {} -> found via simple-make's own records, your system package manager, or a binary already on PATH. remove it first (simple-make -r {}) or use -u to update it instead\x1b[0m", pkg_name, pkg_name);
+        return;
+    }
+
+    if (!(is_github_url || is_github_bare || is_archive_url) && config.use_system_package_manager && platform::try_install_via_package_manager(package)) {
+        locked_println("\x1b[32m(finished) [installed via system package manager] package: {}\x1b[0m", package);
+        locked_println("    (remove it with your system package manager, not `simple-make -r`)");
+        return;
+    }
+
+    if (!prepare_paths(pkg_name))
+        return;
 
     bool fetch_success = true;
 
@@ -610,12 +859,28 @@ void process_package(std::string_view pkg, std::size_t total_packages) {
     } else {
         url = get_fast_link(pkg_name);
         if (url.empty()) {
-            auto res = search_on_gh(pkg_name);
+            auto candidates = search_all_sources(pkg_name);
+            auto best = pick_best_candidate(candidates, pkg_name);
 
-            if (res.has_value()) {
-                url = std::move(res.value());
-            } else {
-                url = "";
+            if (best.has_value()) {
+                url = best->url;
+            } else if (!candidates.empty()) {
+                {
+                    std::scoped_lock lock(mtx);
+                    std::println("\x1b[33m[{}] found more than one plausible match, sorted by stars. choose:\x1b[0m", pkg_name);
+                    for (std::size_t i = 0; i < candidates.size(); i++)
+                        std::println("{}. {} ({}★, {})", i + 1, candidates[i].url, candidates[i].stars, candidates[i].source);
+                    std::print("> ");
+                }
+
+                std::string input;
+                std::getline(std::cin, input);
+
+                try {
+                    int choice = std::stoi(input) - 1;
+                    if (choice >= 0 && choice < static_cast<int>(candidates.size()))
+                        url = candidates[choice].url;
+                } catch (...) {}
             }
         }
 
@@ -638,6 +903,13 @@ void process_package(std::string_view pkg, std::size_t total_packages) {
     if (!build_pkg(std::format("{}/.simple-make/sources/{}", home, pkg_name), total_packages, pkg_name)) {
         locked_println("\x1b[31m(failed) [cannot build] package: {}\x1b[0m", pkg_name);
         return;
+    }
+
+    if (!url.empty()) {
+        std::ofstream url_file(std::format("{}/.simple-make/installed/{}.url", home, pkg_name));
+        url_file << url;
+        url_file.close();
+        platform::fix_ownership(std::format("{}/.simple-make/installed/{}.url", home, pkg_name));
     }
 
     if (!config.keep_sources) {

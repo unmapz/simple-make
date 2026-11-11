@@ -6,6 +6,12 @@
 #include <cstddef>
 #include <print>
 #include <utility>
+#include <format>
+#include <string_view>
+
+#ifndef SIMPLE_MAKE_VERSION
+#define SIMPLE_MAKE_VERSION "0.0.0-dev"
+#endif
 
 extern std::string home;
 
@@ -24,6 +30,6 @@ bool download_file(std::string_view url);
 
 bool unpack(std::string path);
 
-void process_package(std::string_view package, std::size_t total_packages);
+void process_package(std::string_view package, std::size_t total_packages, bool is_update = false);
 
 std::vector<std::string> read_list(std::string_view path);
